@@ -7,7 +7,8 @@ description:
   a mutated process singleton, an order-coupled name - with no test execution,
   so it runs anywhere node does and on every PR. An opt-in confirming pass
   (--confirm) shuffles the suite under a pinned seed and bisects the prefix to
-  name the polluting test. Advisory by default; pytest and vitest idioms.
+  name the polluting test. Advisory by default; pytest, vitest and
+  PHPUnit/WordPress idioms.
 cli: scripts/cli.mjs
 requires: [node>=20]
 ---
@@ -29,12 +30,12 @@ needs no network and no model.
 
 ## Rules (static pass — suspects)
 
-| Rule                              | Severity | Fires on                                                                                                                                                                                                                                                                                                                                                                                                            |
-| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SV001-module-mutable-global`     | medium   | A module-scope mutable (`= {}`, `= []`, `set()`, `dict()`, `list()`, or a top-level JS `let`/`var`/`const` object/array) that some line later mutates in place (`.append`/`.add`/`[...] =`/`+=`/`.attr =`). Fires on the **declaration**, the leak's source.                                                                                                                                                        |
-| `SV002-missing-teardown`          | medium   | A **class/all-scoped** setup whose matching teardown is absent: pytest `setup_class`/`setUpClass`, or vitest/jest `beforeAll`. Per-test setup (`setUp`/`setup_method`/`beforeEach`) is excluded - it rebuilds state each test, so it does not leak.                                                                                                                                                                 |
-| `SV003-shared-singleton-mutation` | low      | A process-global singleton assigned without restore: `os.environ[...] =`, `sys.modules[...] =`, `process.env.X =`. Reads and `==` comparisons never fire, and neither does a file that demonstrably restores the global — a same-key (or computed-loop) restore in `afterEach`/`afterAll`/teardown/post-`yield` fixture code or an in-test `try`/`finally`, or a write-back from a snapshot saved from that global. |
-| `SV004-order-coupled-name`        | low      | A test name or comment that encodes ordering: `test_1_…`, a **terminal** ordinal (`test_first()`, `test_last()` - not `test_first_match_wins`), `must run before …`, `it('… run first')`.                                                                                                                                                                                                                           |
+| Rule                              | Severity | Fires on                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| --------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SV001-module-mutable-global`     | medium   | A module-scope mutable (`= {}`, `= []`, `set()`, `dict()`, `list()`, or a top-level JS `let`/`var`/`const` object/array) that some line later mutates in place (`.append`/`.add`/`[...] =`/`+=`/`.attr =`). Fires on the **declaration**, the leak's source. PHP: a column-0 `$x = [` / `array(`, a `static $x` (local or class property) or a `global $x` import, fired when the file mutates it in place. A static property counts only mutations spelled `self::$x`/`static::$x`/`Name::$x`; a column-0 array counts only unindented mutations, or any mutation when some function imports it with `global` (a file-wide approximation) (`[]=`, `[..] =`, `.=`/`+=`/`??=`, `++`/`--`, `array_push`/`array_shift`/…, `->prop =`). A plain reassign never counts.                                                                                                                                                                                                                                                                                                                                                                                   |
+| `SV002-missing-teardown`          | medium   | A **class/all-scoped** setup whose matching teardown is absent: pytest `setup_class`/`setUpClass`, or vitest/jest `beforeAll`. Per-test setup (`setUp`/`setup_method`/`beforeEach`) is excluded - it rebuilds state each test, so it does not leak. PHP: PHPUnit `setUpBeforeClass`/`tearDownAfterClass`, WordPress `set_up_before_class`/`tear_down_after_class` (`wpSetUpBeforeClass` is excluded: the WP base class deletes its factory data); per-test `setUp`/`set_up` are excluded.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `SV003-shared-singleton-mutation` | low      | A process-global singleton assigned without restore: `os.environ[...] =`, `sys.modules[...] =`, `process.env.X =`. Reads and `==` comparisons never fire, and neither does a file that demonstrably restores the global — a same-key (or computed-loop) restore in `afterEach`/`afterAll`/teardown/post-`yield` fixture code or an in-test `try`/`finally`, or a write-back from a snapshot saved from that global. PHP: superglobal writes (`$_GET`, `$_POST`, `$_COOKIE`, `$_SERVER`, `$_ENV`, `$_SESSION`, `$_REQUEST`, `$_FILES`, `$GLOBALS`), `putenv`, `ini_set`, `date_default_timezone_set`, `define` (never restored: a constant cannot be undefined, so only a `savant-ignore` pragma silences it), and WordPress `add_filter`/`add_action` and `update_option`/`add_option`. Only a global call counts: `$obj->add_action(...)` or `Cls::update_option(...)` is a method and never fires. Restores are `unset`, a family reassign, `putenv('K')`, `ini_restore` and `delete_option` in a `tearDown*`/`tear_down*`/`wpTearDown*` body or a `finally`, plus a matching `remove_filter`/`remove_action`/`remove_all_*` anywhere in the file. |
+| `SV004-order-coupled-name`        | low      | A test name or comment that encodes ordering: `test_1_…`, a **terminal** ordinal (`test_first()`, `test_last()` - not `test_first_match_wins`), `must run before …`, `it('… run first')`. PHP files only: `function testFirst()`, `function test_first()`, `function test_1_…` (Python and JS keep the patterns above, unchanged).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 A finding is a **suspect, not a verdict.** A module dict that is only ever read
 is a legitimate constant and does not fire; only a _mutated_ one does.
@@ -43,8 +44,12 @@ is a legitimate constant and does not fire; only a _mutated_ one does.
 
 The setup/teardown idioms (`SV002`) differ by ecosystem, so the rule is
 conditioned on the file: Python files are read with pytest/unittest markers, JS
-and TS with vitest/jest markers. The idioms do not collide across languages, so
-each file is judged by its own ecosystem's conventions.
+and TS with vitest/jest markers, and `.php` files with PHPUnit/WordPress
+markers. The idioms do not collide across languages, so each file is judged by
+its own ecosystem's conventions. In a PHP class that `extends` a
+`WP_*UnitTestCase*` base, hook and option mutations count as restored (the
+framework backs up and restores hooks and rolls back the DB per test);
+superglobals do not.
 
 ## Fidelity limits (AST-lite, on purpose)
 
@@ -77,6 +82,20 @@ The static pass is a scanner with no parser dependency, so it ships anywhere
   makes for frozen clocks. `vi.unstubAllEnvs`/`monkeypatch` never suppress a
   direct assignment: they only undo their own mutations.
 - **Line-scoped.** A declaration or call split across lines can be missed.
+- **PHP heredoc/nowdoc bodies and multi-line calls** are line-scoped like every
+  other multi-line construct. Continuation lines read as code.
+- **PHP `$old = ini_set('k', 'v')`** (inline capture) is not recognised as a
+  restore on its own; the restore must be spelled out in teardown.
+- **An intermediate custom WordPress base**
+  (`extends My_TestCase extends WP_UnitTestCase`) is not followed, so hooks
+  there still fire.
+- **PHPUnit `backupGlobals`** (phpunit.xml or attribute) is invisible to a file
+  scan, so superglobal writes in such suites can be false suspects.
+- **A trailing comment on a code line is not stripped for `SV003`**, the same as
+  JS and Python today.
+- **`--confirm` has no PHPUnit runner:** a `.php` path, or a directory whose
+  test files are PHP, declines as `unknown_framework` even when the working
+  directory holds a `vitest.config.*` or pytest marker.
 - **A missed suspect costs less than a false one** — the same bias as
   canary-blackhawk.
 
@@ -108,10 +127,13 @@ finding with an inline pragma, same dialect as `blackhawk-ignore`:
 ## Which files get scanned
 
 A directory walk only visits **test** files — `*.test.*`, `*.spec.*`,
-`test_*.py`, `*_test.py`, or any supported source under `tests/`, `test/`,
-`__tests__/`, `e2e/`, `spec/`. A file named explicitly on the command line is
-always scanned. Supported suffixes: `.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`,
-`.cjs`. Dependency directories (`node_modules`, `.venv`, …) are never walked.
+`test_*.py`, `*_test.py`, `*Test.php` (PHPUnit), `test-*.php` (WordPress), or
+any JS/Python source under `tests/`, `test/`, `__tests__/`, `e2e/`, `spec/`. A
+PHP file is walked only when its name says test, so `tests/bootstrap.php` and
+`wp-tests-config.php` (whose `define()`s are the point) are not scanned. A file
+named explicitly on the command line is always scanned. Supported suffixes:
+`.py`, `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.php`. Dependency
+directories (`node_modules`, `vendor`, `.venv`, …) are never walked.
 
 ## Invocation
 
@@ -177,7 +199,8 @@ canary skills run canary-savant -- tests --confirm --seed 424242
 plugin (`pytest-randomly` or `pytest-random-order`) and declines loudly if none
 is installed; vitest's shuffle is built in (`--sequence.shuffle`), so no plugin
 is required. Node drives the project's _own_ runner — savant orchestrates it, it
-does not run in the target's language.
+does not run in the target's language. PHP targets are static-pass only:
+`--confirm` declines them (see the fidelity limits above).
 
 **Polluter bisect is pytest-only.** vitest has no CLI-driven ordered per-test
 execution, so a vitest target gets victim _detection_ (which tests break under

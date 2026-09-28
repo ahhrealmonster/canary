@@ -13,12 +13,18 @@ import {
   SEVERITY,
   WHY,
   SV004_CODE_PATTERN,
+  PHP_SV004_CODE_PATTERN,
   SV004_TEXT_PATTERN,
   PYTHON_SETUP_TEARDOWN,
   JS_SETUP_TEARDOWN,
+  PHP_SETUP_TEARDOWN,
   PY_MODULE_MUTABLE,
   JS_MODULE_MUTABLE,
+  PHP_MODULE_MUTABLE,
+  PHP_STATIC_DECL,
+  PHP_GLOBAL_DECL,
   mutationPattern,
+  phpMutationPattern,
 } from './rules.mjs';
 import {
   analyzeRestoration,
@@ -41,6 +47,7 @@ const SUPPORTED_SUFFIXES = [
   '.tsx',
   '.mjs',
   '.cjs',
+  '.php',
 ];
 
 const SKIP_DIRS = new Set([
@@ -54,6 +61,7 @@ const SKIP_DIRS = new Set([
   '.mypy_cache',
   '.pytest_cache',
   '.tox',
+  'vendor', // Composer's node_modules (#1106)
   // Fixture directories are test DATA: files here never RUN as tests, so a
   // temporal/order smell in one is a property of the data, not a defect (#493
   // one level up). Also keeps pragmas out of golden-pinned fixture files.
@@ -80,6 +88,9 @@ function isTestFile(filePath) {
   if (!SUPPORTED_SUFFIXES.includes(suffix)) return false;
   const name = path.basename(filePath);
   const stem = name.slice(0, name.length - suffix.length);
+  // PHPUnit FooTest.php, WordPress test-foo.php (#1106 D11) - by name only:
+  // tests/ also holds bootstrap.php and wp-tests-config.php, never tests.
+  if (suffix === '.php') return /^test-|Test$/.test(stem);
   if (name.includes('.test.') || name.includes('.spec.')) return true;
   if (stem.startsWith('test_') || stem.endsWith('_test')) return true;
   const dirs = partsOf(filePath).slice(0, -1);
@@ -129,6 +140,59 @@ function sv001ModuleMutables(lines, file, isPy, text) {
   return findings;
 }
 
+/**
+ * PHP shared declarations on a code line (#1106 D4), as [name, scope] with the
+ * name without `$`. Scope decides which mutations indict it: `bare` (local
+ * `static`, `global`) any `$x`; `qualified` (a class static property) only
+ * `Name::$x`; `module` (column 0) only file-scope code or a `global` import.
+ */
+function phpDeclaredNames(code) {
+  const names = [];
+  const moduleLevel = PHP_MODULE_MUTABLE.exec(code); // anchored at column 0
+  if (moduleLevel) names.push([moduleLevel[1], 'module']);
+  const stat = PHP_STATIC_DECL.exec(code);
+  if (stat) names.push([stat[2], stat[1] ? 'qualified' : 'bare']);
+  for (const n of phpGlobalNames(code)) names.push([n, 'bare']);
+  return names;
+}
+
+const phpGlobalNames = (code) => {
+  const glob = PHP_GLOBAL_DECL.exec(code);
+  return glob ? glob[1].split(',').map((v) => v.trim().slice(1)) : [];
+};
+
+/**
+ * PHP SV001: a column-0 array, a `static $x` or a `global $x` import fires on
+ * its declaration line when the file mutates that variable in place. Both
+ * halves read the code-only projection, so comments and strings never count.
+ * A column-0 array is judged against unindented lines, plus the whole file
+ * when ANY function imports it with `global` - an approximation: which
+ * function holds the import is not tracked.
+ */
+function sv001PhpMutables(lines, file) {
+  const codeLines = lines.map(codeOnly);
+  const text = {
+    all: codeLines.join('\n'),
+    top: codeLines.filter((c) => !/^\s/.test(c)).join('\n'),
+  };
+  const imported = new Set(codeLines.flatMap(phpGlobalNames));
+  const indicts = ([name, scope]) => {
+    const pattern = phpMutationPattern(name, scope === 'qualified');
+    const wide = scope !== 'module' || imported.has(name);
+    return pattern.test(wide ? text.all : text.top);
+  };
+  const findings = [];
+  codeLines.forEach((code, i) => {
+    if (phpDeclaredNames(code).some(indicts)) {
+      const snippet = lines[i].trim();
+      findings.push(
+        makeFinding(file, i + 1, 'SV001-module-mutable-global', snippet),
+      );
+    }
+  });
+  return findings;
+}
+
 // Line comment openers, for the code-only projection below. A whole-line
 // comment is caught earlier by isComment (which also covers block-comment
 // continuations and Python docstring fences).
@@ -164,9 +228,34 @@ function codeOnly(line) {
   return out;
 }
 
+// Per-language rule inputs (#1106): one table instead of isPy/isPhp branches,
+// so scanTextFull's complexity does not grow with each language.
+const LANGS = {
+  py: {
+    pairs: PYTHON_SETUP_TEARDOWN,
+    setupHit: (code, setup) => code.includes(`def ${setup}`),
+    sv001: (lines, file, text) => sv001ModuleMutables(lines, file, true, text),
+  },
+  js: {
+    pairs: JS_SETUP_TEARDOWN,
+    setupHit: (code, setup) =>
+      code.startsWith(`${setup}(`) || code.includes(` ${setup}(`),
+    sv001: (lines, file, text) => sv001ModuleMutables(lines, file, false, text),
+  },
+  php: {
+    pairs: PHP_SETUP_TEARDOWN,
+    setupHit: (code, setup) => code.includes(`function ${setup}(`),
+    sv001: (lines, file) => sv001PhpMutables(lines, file),
+  },
+};
+const langOf = (file) => {
+  if (file.endsWith('.py')) return 'py';
+  return file.endsWith('.php') ? 'php' : 'js';
+};
+
 /** Setup markers whose matching teardown is absent from the file. */
-function sv002MissingTeardown(lines, file, isPy) {
-  const pairs = isPy ? PYTHON_SETUP_TEARDOWN : JS_SETUP_TEARDOWN;
+function sv002MissingTeardown(lines, file, lang) {
+  const { pairs, setupHit } = LANGS[lang];
   // #732: pair against code only. Both halves read the same projection, so
   // the rule can no longer be switched off by a comment or a fixture string.
   const codeLines = lines.map(codeOnly);
@@ -177,10 +266,7 @@ function sv002MissingTeardown(lines, file, isPy) {
     for (let i = 0; i < lines.length; i += 1) {
       const code = codeLines[i].trim();
       if (!code) continue;
-      const hit = isPy
-        ? code.includes(`def ${setup}`)
-        : code.startsWith(`${setup}(`) || code.includes(` ${setup}(`);
-      if (hit) {
+      if (setupHit(code, setup)) {
         const stripped = lines[i].trim();
         findings.push(
           makeFinding(file, i + 1, 'SV002-missing-teardown', stripped),
@@ -237,16 +323,17 @@ const tokenMatches = (ruleId, token) =>
  * @returns {{findings: Finding[], suppressed: Finding[]}}
  */
 export function scanTextFull(text, file = '<text>') {
-  const isPy = file.endsWith('.py');
+  const lang = langOf(file);
+  const isPhp = lang === 'php';
   const lines = splitLines(text);
   const findings = [];
   // #493 root cause 2: SV003's why asserts persistence, so a file that
   // restores the global (teardown restore or snapshot write-back) must not
   // be flagged. Computed once per file.
-  const restoration = analyzeRestoration(text);
+  const restoration = analyzeRestoration(text, isPhp);
 
-  findings.push(...sv001ModuleMutables(lines, file, isPy, text));
-  findings.push(...sv002MissingTeardown(lines, file, isPy));
+  findings.push(...LANGS[lang].sv001(lines, file, text));
+  findings.push(...sv002MissingTeardown(lines, file, lang));
 
   lines.forEach((raw, i) => {
     const stripped = raw.trim();
@@ -258,7 +345,11 @@ export function scanTextFull(text, file = '<text>') {
     const ranges = stringLiteralRanges(stripped);
     // SV004 is self-reported ordering: it fires on comments and code alike.
     if (
-      execOutsideStrings(SV004_CODE_PATTERN, stripped, ranges) ||
+      execOutsideStrings(
+        isPhp ? PHP_SV004_CODE_PATTERN : SV004_CODE_PATTERN,
+        stripped,
+        ranges,
+      ) ||
       SV004_TEXT_PATTERN.test(stripped)
     ) {
       findings.push(
@@ -266,7 +357,7 @@ export function scanTextFull(text, file = '<text>') {
       );
     }
     if (isComment(stripped)) return;
-    const mutation = classifyMutation(stripped, ranges);
+    const mutation = classifyMutation(stripped, ranges, isPhp);
     if (mutation) {
       const restored =
         isSnapshotWriteBack(mutation, lines) ||

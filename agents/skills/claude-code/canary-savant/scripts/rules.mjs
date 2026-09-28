@@ -53,6 +53,79 @@ export const SEVERITY = Object.fromEntries(
   RULES.map((r) => [r.ruleId, r.severity]),
 );
 
+// PHP families (#1106) carry `php: true` and apply to .php files only (a JS
+// `define(` is AMD, not a constant). Optional fields: `keyOf(match)` when the
+// key is not group 1; `unrestorable` (no restore launders it); `pairAnywhere`
+// (a delete ANYWHERE in the file restores: WP's inline add_filter ...
+// remove_filter); `wpAutoRestored` (a WP_UnitTestCase base restores it).
+// PHP_ASSIGN is plain or compound (.= += ??= ...), never `==`/`===`/`=>`.
+const PHP_OP = String.raw`(?:\.|\?\?|\*\*|<<|>>|[-+*/%&|^])`;
+const PHP_ASSIGN = String.raw`\s*${PHP_OP}?=(?![=>])`;
+// $_GET['k'] = | $_GET['k']['n'] .= | $_GET[] = | $_GET = ... (group 1: key)
+const superglobal = (name) => ({
+  id: `$${name}`,
+  token: String.raw`\$${name}`,
+  php: true,
+  assign: new RegExp(
+    String.raw`(?<![\w$])\$${name}\b\s*(?:\[([^\]]*)\](?:\s*\[[^\]]*\])*)?` +
+      PHP_ASSIGN,
+  ),
+  deletes: [new RegExp(String.raw`\bunset\s*\(\s*\$${name}\b\s*\[([^\]]*)\]`)],
+  restoreAll: [],
+});
+const phpCall = (id, assign, deletes, extra = {}) => ({
+  id,
+  token: id,
+  php: true,
+  assign,
+  deletes,
+  restoreAll: [],
+  ...extra,
+});
+// A global function call: never a method (`->f(`, `?->f(`), a static call
+// (`::f(`) or a declaration (`function f(`), which share only the name.
+const fn = (src) =>
+  new RegExp(String.raw`(?<![\w$>:])(?<!\bfunction\s+)` + src);
+const SUPERGLOBALS = '_GET _POST _COOKIE _SERVER _ENV _SESSION _REQUEST _FILES';
+const PHP_FAMILIES = [
+  ...[...SUPERGLOBALS.split(' '), 'GLOBALS'].map(superglobal),
+  // putenv('NAME=v') sets; putenv('NAME') (no `=`) unsets, i.e. restores.
+  phpCall(
+    'putenv',
+    fn(String.raw`putenv\s*\(\s*(['"])([^'"=]+)=`),
+    [fn(String.raw`putenv\s*\(\s*(['"])([^'"=]+)\1\s*\)`)],
+    { keyOf: (m) => m[2] },
+  ),
+  phpCall('ini_set', fn(String.raw`ini_set\s*\(\s*([^,)]+)`), [
+    fn(String.raw`ini_restore\s*\(\s*([^,)]+)`),
+  ]),
+  phpCall(
+    'date_default_timezone_set',
+    fn(String.raw`date_default_timezone_set\s*\(`),
+    [],
+  ),
+  // A PHP constant can never be undefined. `defined(` does not match.
+  phpCall('define', fn(String.raw`define\s*\(\s*([^,)]+)`), [], {
+    unrestorable: true,
+  }),
+  phpCall(
+    'wp.hooks',
+    fn(String.raw`add_(?:filter|action)\s*\(\s*([^,)]+)`),
+    [
+      fn(
+        String.raw`remove_(?:filter|action|all_filters|all_actions)\s*\(\s*([^,)]+)`,
+      ),
+    ],
+    { pairAnywhere: true, wpAutoRestored: true },
+  ),
+  phpCall(
+    'wp.options',
+    fn(String.raw`(?:update|add)_option\s*\(\s*([^,)]+)`),
+    [fn(String.raw`delete_option\s*\(\s*([^,)]+)`)],
+    { wpAutoRestored: true },
+  ),
+];
+
 // SV003: singleton / env mutation (assignment, never a read or comparison).
 // A trailing negative lookahead on `=` keeps `==` comparisons out. One entry
 // per process-global family (#493): `assign` detects the mutation (and, in a
@@ -89,7 +162,20 @@ export const SINGLETON_FAMILIES = [
     ],
     restoreAll: [/\bsys\.modules\.update\s*\(/],
   },
+  ...PHP_FAMILIES,
 ];
+// SV003 restore context for PHP (#1106), read by restoration.mjs.
+export const familiesFor = (isPhp) =>
+  SINGLETON_FAMILIES.filter((family) => isPhp || !family.php);
+// A teardown method; the lookahead skips a bodiless `...(): void;` declaration.
+export const PHP_TEARDOWN_FN =
+  /\bfunction\s+(?:tear_?down\w*|wpTearDown\w*)\s*\((?![^{]*;\s*$)/i;
+// A whole-line comment: a remove_filter() there is prose, not a pairing.
+export const COMMENT_LINE = /^\s*(?:\/\/|#|\*|\/\*)/;
+// A class extending a WP_*UnitTestCase* base (D9): the framework restores
+// hooks and rolls the DB back per test. Class-anchored, so a comment can't.
+export const WP_TESTCASE_BASE =
+  /^\s*(?:(?:abstract|final|readonly)\s+)*class\s+\w+\s+extends\s+\\?WP_\w*UnitTestCase\w*\b/;
 
 // SV004: order-coupled name or comment (fires on code and comment lines).
 // Split in two (#493) because the alternatives anchor differently:
@@ -101,6 +187,10 @@ export const SINGLETON_FAMILIES = [
 //   it('... run first')       -> ordering inside an it() title (anchor: `it(`)
 export const SV004_CODE_PATTERN =
   /\bdef\s+test_\d+_|\bdef\s+test_(?:first|second|third|fourth|fifth|sixth|seventh|last|initial|final)\s*[(:]|\bit\s*\(\s*['"][^'"]*\b(?:run|runs|running)\s+(?:first|last|before|after)\b/i;
+// PHP only (#1106), so Python/JS stay as they were: `function test_1_...`,
+// `function testFirst(` / `test_first(` (PHPUnit camelCase or snake_case).
+export const PHP_SV004_CODE_PATTERN =
+  /\bfunction\s+test_\d+_|\bfunction\s+test_?(?:first|second|third|fourth|fifth|sixth|seventh|last|initial|final)\s*\(/i;
 //
 // TEXT-anchored: the directive legitimately lives inside strings (test
 // titles, docstrings) and comments, so it is NOT string-literal filtered.
@@ -120,6 +210,13 @@ export const PYTHON_SETUP_TEARDOWN = [
   ['setUpClass', 'tearDownClass'],
 ];
 export const JS_SETUP_TEARDOWN = [['beforeAll', 'afterAll']];
+// PHPUnit, then WP_UnitTestCase's snake_case spelling (#1106 D6).
+// wpSetUpBeforeClass is deliberately absent: WP's base class deletes the
+// factory data it builds, so it never needs its own teardown.
+export const PHP_SETUP_TEARDOWN = [
+  ['setUpBeforeClass', 'tearDownAfterClass'],
+  ['set_up_before_class', 'tear_down_after_class'],
+];
 
 // SV001: mutable-literal declarations and the mutations that indict them.
 //   Python:  NAME = {} | [] | set() | dict() | list()   (optional trailing #comment)
@@ -128,6 +225,15 @@ export const PY_MODULE_MUTABLE =
 //   JS: (let|var|const) NAME = {} | []
 export const JS_MODULE_MUTABLE =
   /^(?:let|var|const)\s+(\w+)\s*=\s*(?:\{[^}]*\}|\[[^\]]*\])/;
+// PHP (#1106), NAME captured without `$`; superglobals are SV003's (D5).
+//   column-0  $x = [ ...  |  $x = array( ...
+export const PHP_MODULE_MUTABLE =
+  /^\$(?!_[A-Z]|GLOBALS\b)(\w+)\s*=\s*(?:\[|array\s*\()/;
+//   static $x (local)  |  public static ?array $x (property: group 1 set)
+export const PHP_STATIC_DECL =
+  /^\s*((?:(?:public|protected|private|final|readonly)\s+)*)static\s+(?:\??[\w\\|]+\s+)?\$(\w+)/;
+//   global $a, $b;
+export const PHP_GLOBAL_DECL = /^\s*global\s+(\$\w+(?:\s*,\s*\$\w+)*)\s*;/;
 
 // Method calls that mutate a container in place (Python + JS array/object).
 const MUTATING_METHODS = [
@@ -164,5 +270,28 @@ export function mutationPattern(name) {
       `|\\b${n}\\s*\\.\\s*(?:${methods})\\s*\\(` +
       `|\\b${n}\\s*\\+=` +
       `|\\b${n}\\s*\\.\\w+\\s*=(?!=)`,
+  );
+}
+
+/**
+ * PHP (#1106): an in-place mutation of `$name` - `$x[..] =`, `$x[] =`,
+ * compound assignment, `++`/`--`, array_push/unshift/splice/pop/shift, or
+ * `$x->prop =`. A plain `$x = ...` is not one: it is also how a restore is
+ * written. `(?<![\w$])` and `\b` keep `$x` from matching `$xy`. A static
+ * property is only reachable qualified (`self::$x`, `Foo::$x`).
+ * @param {string} name the variable, without `$`
+ * @param {boolean} [qualified] require a `Name::` prefix
+ * @returns {RegExp}
+ */
+export function phpMutationPattern(name, qualified = false) {
+  const scope = qualified ? String.raw`\b\w+::` : String.raw`(?<![\w$])`;
+  const v = String.raw`${scope}\$${escapeRe(name)}\b`;
+  const index = String.raw`\s*\[[^\]]*\]`;
+  return new RegExp(
+    `${v}(?:${index})+${PHP_ASSIGN}` +
+      `|${v}\\s*${PHP_OP}=(?![=>])` +
+      `|${v}\\s*(?:\\+\\+|--)|(?:\\+\\+|--)\\s*${v}` +
+      `|\\barray_(?:push|unshift|splice|pop|shift)\\s*\\(\\s*${v}` +
+      `|${v}\\s*->\\s*\\w+(?:${index})*${PHP_ASSIGN}`,
   );
 }

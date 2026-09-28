@@ -1,0 +1,786 @@
+// canary-savant PHP support (#1106): PHPUnit and WordPress idioms for the
+// static pass (SV001-SV004). Spec: docs/changes/1106-savant-php/proposal.md.
+//
+// CI TRAP: savant and blackhawk scan THIS file with --strict. Every PHP
+// fixture line is its own single-line string literal, joined with '\n'. A
+// multi-line template literal's continuation lines would read as CODE and
+// fire on canary's own suite.
+
+import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import {
+  scanText,
+  scanPaths,
+} from '../claude-code/canary-savant/scripts/scanner.mjs';
+import { classifyMutation } from '../claude-code/canary-savant/scripts/restoration.mjs';
+import { detectFramework } from '../claude-code/canary-savant/scripts/runner.mjs';
+import { stringLiteralRanges } from '../claude-code/canary-savant/scripts/string-literals.mjs';
+
+// Braced bodies on purpose (see canary-savant.restoration.test.ts, #495).
+const php = (...lines: string[]) => {
+  return ['<?php', ...lines].join('\n');
+};
+
+// --- Test-file discovery (D11) ---------------------------------------------
+
+function withTree(files: string[], fn: (root: string) => void) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'savant-php-'));
+  try {
+    for (const rel of files) {
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, php('echo 1;'));
+    }
+    fn(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe('PHP test-file discovery (#1106 D11)', () => {
+  it('walks FooTest.php and test-foo.php, nothing else', () => {
+    const files = [
+      'plugin/FooTest.php',
+      'plugin/test-foo.php',
+      'src/Foo.php',
+      'plugin/helper.php',
+    ];
+    withTree(files, (root) => {
+      expect(scanPaths([root]).filesScanned).toBe(2);
+    });
+  });
+
+  // Fix round: tests/ holds PHP bootstrap and config that never run as tests
+  // (and a bootstrap's define()s are the point), so the directory is not
+  // enough for .php - the NAME must say test.
+  it('walks tests/FooTest.php but not tests/ bootstrap or config', () => {
+    const files = [
+      'tests/FooTest.php',
+      'tests/bootstrap.php',
+      'tests/wp-tests-config.php',
+      'tests/unit/Bar.php',
+    ];
+    withTree(files, (root) => {
+      const { filesScanned } = scanPaths([root]);
+      expect(filesScanned).toBe(1);
+    });
+  });
+
+  it('still scans tests/bootstrap.php when named explicitly', () => {
+    withTree(['tests/bootstrap.php'], (root) => {
+      const file = path.join(root, 'tests', 'bootstrap.php');
+      expect(scanPaths([file]).filesScanned).toBe(1);
+    });
+  });
+
+  it('keeps walking JS and Python sources under tests/', () => {
+    withTree(['tests/helper.js', 'tests/helper.py'], (root) => {
+      expect(scanPaths([root]).filesScanned).toBe(2);
+    });
+  });
+
+  it('never walks vendor/, even its test files', () => {
+    const files = ['vendor/acme/tests/VendorTest.php', 'vendor/acme/a.test.js'];
+    withTree(files, (root) => {
+      expect(scanPaths([root]).filesScanned).toBe(0);
+    });
+  });
+
+  it('scans a .php file named explicitly, whatever its name', () => {
+    withTree(['src/Foo.php'], (root) => {
+      const file = path.join(root, 'src', 'Foo.php');
+      expect(scanPaths([file]).filesScanned).toBe(1);
+    });
+  });
+});
+
+// Line 1 `<?php`, line 2 the class head, line 3 `{`, body from line 4.
+const inClass = (body: string[], head = 'class FooTest extends TestCase') => {
+  return php(head, '{', ...body, '}');
+};
+// `line:rule` pairs, e.g. ['4:SV003'], so every assertion pins the line.
+const hits = (text: string, name = 'FooTest.php') => {
+  return scanText(text, name).map((f) => `${f.line}:${f.ruleId.slice(0, 5)}`);
+};
+
+// --- SV002 (D6) ------------------------------------------------------------
+
+describe('SV002 PHP class-scoped pairs (#1106 D6)', () => {
+  it.each([
+    ['setUpBeforeClass', 'tearDownAfterClass'],
+    ['set_up_before_class', 'tear_down_after_class'],
+  ])('%s without %s fires; with it, silent', (setup, teardown) => {
+    const up = `    public static function ${setup}(): void {}`;
+    const down = `    public static function ${teardown}(): void {}`;
+    expect(hits(inClass([up]))).toEqual(['4:SV002']);
+    expect(hits(inClass([up, down]))).toEqual([]);
+  });
+
+  it.each(['setUp', 'set_up'])('per-test %s alone is silent', (setup) => {
+    expect(
+      hits(inClass([`    protected function ${setup}(): void {}`])),
+    ).toEqual([]);
+  });
+
+  // Amended at plan approval: WP's base tear_down_after_class deletes the
+  // factory data wpSetUpBeforeClass builds, so it needs no teardown of its own.
+  it('wpSetUpBeforeClass alone is silent (the WP base cleans up)', () => {
+    const up =
+      '    public static function wpSetUpBeforeClass(WP_UnitTest_Factory $f) {}';
+    expect(
+      hits(inClass([up], 'class Tests_Foo extends WP_UnitTestCase')),
+    ).toEqual([]);
+  });
+
+  it('a setup named only in a comment or a string does not fire', () => {
+    const body = [
+      '    // public static function setUpBeforeClass(): void {}',
+      "    private $doc = 'function setUpBeforeClass()';",
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a teardown named only in a comment does not pair', () => {
+    const body = [
+      '    public static function setUpBeforeClass(): void {}',
+      '    // tearDownAfterClass() is inherited',
+    ];
+    expect(hits(inClass(body))).toEqual(['4:SV002']);
+  });
+});
+
+// --- SV003 families (D7) ---------------------------------------------------
+
+const classifyPhp = (line: string) => {
+  return classifyMutation(line, stringLiteralRanges(line), true);
+};
+
+describe('classifyMutation: PHP families (#1106 D7)', () => {
+  it.each([
+    ["$_GET['q'] = 'x';", '$_GET', 'q'],
+    ["$_SERVER['HTTP_HOST'] = 'example.org';", '$_SERVER', 'HTTP_HOST'],
+    ["$_SESSION['a']['b'] = 1;", '$_SESSION', 'a'],
+    ["$_COOKIE['c'] .= 'x';", '$_COOKIE', 'c'],
+    ["$_REQUEST['r'] ??= 1;", '$_REQUEST', 'r'],
+    ['$_FILES[] = $upload;', '$_FILES', null],
+    ['$_POST = [];', '$_POST', null],
+    ["$_ENV['APP_ENV'] = 'test';", '$_ENV', 'APP_ENV'],
+    ["$GLOBALS['wp_rewrite'] = null;", '$GLOBALS', 'wp_rewrite'],
+    ["putenv('APP_ENV=test');", 'putenv', 'APP_ENV'],
+    ["ini_set('precision', '4');", 'ini_set', 'precision'],
+    ["date_default_timezone_set('UTC');", 'date_default_timezone_set', null],
+    ["define('WP_DEBUG', true);", 'define', 'WP_DEBUG'],
+    [
+      "add_filter('the_title', '__return_empty_string');",
+      'wp.hooks',
+      'the_title',
+    ],
+    ["add_action( 'init', 'boot' );", 'wp.hooks', 'init'],
+    ["update_option('blogname', 'x');", 'wp.options', 'blogname'],
+    ["add_option('k', 1);", 'wp.options', 'k'],
+  ])('classifies %s as %s', (line, family, key) => {
+    expect(classifyPhp(line)).toMatchObject({ family, key });
+  });
+
+  it.each([
+    "if ($_GET['q'] == 'x') {}",
+    "$same = $_GET['q'] === 'x';",
+    "$q = $_GET['q'];",
+    "$pairs = [$_GET['q'] => 1];",
+    '$_GETX = 1;',
+    "if (!defined('WP_DEBUG')) {}",
+    "$this->define('X', 1);",
+    "Foo::define('X', 1);",
+    "$v = get_option('blogname');",
+  ])('returns null for the read or comparison %s', (line) => {
+    expect(classifyPhp(line)).toBeNull();
+  });
+
+  // Fix round: a method or static call that shares a global function's name
+  // is the object's business, not the process's.
+  it.each([
+    '$this->loader->add_action("init", [$this, "boot"]);',
+    '$this->add_filter("the_title", "x");',
+    '$c::update_option("k", 1);',
+    '$repo->add_option("k", 1);',
+    '$cfg->ini_set("precision", "4");',
+    'Env::putenv("A=1");',
+    '$clock?->date_default_timezone_set("UTC");',
+    'public function define($x) {}',
+    'function define($name, $value) {}',
+  ])('returns null for the method or declaration %s', (line) => {
+    expect(classifyPhp(line)).toBeNull();
+  });
+
+  it('never applies a PHP family outside .php (a JS define( is AMD)', () => {
+    const lines = [
+      "define(['dep'], factory);",
+      "$_GET['q'] = 1;",
+      "add_filter('x', cb);",
+    ];
+    for (const line of lines) {
+      expect(classifyMutation(line, stringLiteralRanges(line))).toBeNull();
+    }
+  });
+});
+
+describe('SV003 PHP in the scanner (#1106)', () => {
+  it('a superglobal write with no restore fires on its line', () => {
+    const body = [
+      '    public function test_a(): void',
+      '    {',
+      "        $_GET['q'] = 'x';",
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual(['6:SV003']);
+  });
+
+  it.each([
+    "$_SERVER['X'] .= 'y';",
+    '$_SESSION[] = 1;',
+    '$_POST = [];',
+    "define('FOO', 1);",
+    "putenv('APP_ENV=test');",
+    "ini_set('precision', '4');",
+    "date_default_timezone_set('UTC');",
+    "add_filter('the_title', 'x');",
+    "update_option('blogname', 'x');",
+  ])('%s with no restore fires', (stmt) => {
+    expect(hits(inClass([`        ${stmt}`]))).toEqual(['4:SV003']);
+  });
+
+  it('a restore in a finally block is silent', () => {
+    const body = [
+      '    public function test_a(): void',
+      '    {',
+      '        try {',
+      "            $_GET['q'] = 'x';",
+      '        } finally {',
+      "            unset($_GET['q']);",
+      '        }',
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('the snapshot write-back line itself is silent', () => {
+    const body = [
+      '    public function test_a(): void',
+      '    {',
+      '        $saved = $_SERVER;',
+      "        $_SERVER['HTTPS'] = 'on';",
+      '        $_SERVER = $saved;',
+      '    }',
+    ];
+    // Only the HTTPS write (line 7); the write-back on line 8 is the restore.
+    expect(hits(inClass(body))).toEqual(['7:SV003']);
+  });
+
+  it('reads and comparisons never fire', () => {
+    const body = [
+      "        $q = $_GET['q'];",
+      "        if ($_GET['q'] === 'x') {}",
+      "        if (!defined('X')) {}",
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a token in a comment never fires', () => {
+    const body = [
+      "        // $_GET['q'] = 'x';",
+      "        # putenv('A=1');",
+      "        /* define('X', 1); */",
+      "         * add_filter('a', 'b');",
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a token in a string never fires', () => {
+    const body = [
+      '        $s = "$_GET[\'q\'] = 1";',
+      '        $t = \'putenv("A=1")\';',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('JS and Python files keep ignoring PHP tokens', () => {
+    expect(hits("define(['a'], function (a) {});", 'a.test.js')).toEqual([]);
+    expect(hits("$_GET['q'] = 1;", 'a.test.js')).toEqual([]);
+    expect(hits("os.putenv('A=1')", 'test_a.py')).toEqual([]);
+  });
+});
+
+// --- SV003 restore evidence (D8) -------------------------------------------
+
+describe('SV003 PHP teardown regions (#1106 D8)', () => {
+  it('an unset in tearDown (Allman brace) restores the key', () => {
+    const body = [
+      "    public function test_a(): void { $_GET['q'] = 'x'; }",
+      '    protected function tearDown(): void',
+      '    {',
+      "        unset($_GET['q']);",
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a whole-family reassign in tear_down restores every key', () => {
+    const body = [
+      "    public function test_a() { $_COOKIE['c'] = 1; }",
+      '    public function tear_down() {',
+      '        $_COOKIE = [];',
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('wpTearDownAfterClass is a teardown region', () => {
+    const body = [
+      "    public static function wpSetUpBeforeClass() { $GLOBALS['x'] = 1; }",
+      '    public static function wpTearDownAfterClass() {',
+      "        unset($GLOBALS['x']);",
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a restore of a different key leaves the write flagged', () => {
+    const body = [
+      "    public function test_a() { $_GET['a'] = 1; }",
+      '    protected function tearDown(): void {',
+      "        unset($_GET['b']);",
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual(['4:SV003']);
+  });
+
+  it('the region ends at the method close brace', () => {
+    const body = [
+      '    protected function tearDown(): void {',
+      '        parent::tearDown();',
+      '    }',
+      "    public function test_a() { $_GET['a'] = 1; }",
+    ];
+    expect(hits(inClass(body))).toEqual(['7:SV003']);
+  });
+
+  it('a bodiless abstract teardown opens no region', () => {
+    const text = php(
+      'abstract class BaseTest extends TestCase',
+      '{',
+      '    abstract protected function tearDownFixture(): void;',
+      "    public function helper() { unset($_GET['a']); }",
+      "    public function test_a() { $_GET['a'] = 1; }",
+      '}',
+    );
+    expect(hits(text, 'BaseTest.php')).toEqual(['6:SV003']);
+  });
+
+  it('a teardown token inside a string opens no region', () => {
+    const body = [
+      "    private $doc = 'function tearDown() {';",
+      "    public function helper() { unset($_GET['a']); }",
+      "    public function test_a() { $_GET['a'] = 1; }",
+    ];
+    expect(hits(inClass(body))).toEqual(['6:SV003']);
+  });
+
+  it.each([
+    ["putenv('APP_ENV=test');", "putenv('APP_ENV');"],
+    ["ini_set('precision', '4');", "ini_restore('precision');"],
+    ["ini_set('precision', '4');", "ini_set('precision', $this->old);"],
+    [
+      "date_default_timezone_set('UTC');",
+      'date_default_timezone_set($this->tz);',
+    ],
+    ["update_option('blogname', 'x');", "delete_option('blogname');"],
+    ["$_SERVER['HTTPS'] = 'on';", '$_SERVER = $this->server;'],
+  ])('%s is restored by %s in tearDown', (write, restore) => {
+    const body = [
+      `    public function test_a() { ${write} }`,
+      '    protected function tearDown(): void {',
+      `        ${restore}`,
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+});
+
+describe('SV003 PHP ignores Python/JS regions (#1106 review)', () => {
+  // A PHP data provider is a generator: the code after its `yield` is not a
+  // pytest fixture teardown, so it must not launder a test's write.
+  it('a $_GET reset after a provider yield does not restore a test write', () => {
+    const body = [
+      '    public static function provider() {',
+      "        yield ['a'];",
+      '        $_GET = [];',
+      '    }',
+      '    public function test_q() {',
+      "        $_GET['q'] = 1;",
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual(['6:SV003', '9:SV003']);
+  });
+});
+
+describe('SV003 PHP restore policy (#1106 D7/D8)', () => {
+  it('define fires even when a teardown redefines it (unrestorable)', () => {
+    const body = [
+      "    public function test_a() { define('FOO', 1); }",
+      '    protected function tearDown(): void {',
+      "        define('FOO', 2);",
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual(['4:SV003', '6:SV003']);
+  });
+
+  it.each([
+    ["add_filter('the_title', 'x');", "remove_filter('the_title', 'x');"],
+    ["add_action('init', 'boot');", "remove_action('init', 'boot');"],
+    ["add_filter('the_title', 'x');", "remove_all_filters('the_title');"],
+    ["add_action('init', 'boot');", "remove_all_actions('init');"],
+  ])('%s is paired by %s anywhere in the file', (add, remove) => {
+    const body = [
+      '    public function test_a(): void',
+      '    {',
+      `        ${add}`,
+      '        $this->assertTrue(true);',
+      `        ${remove}`,
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a remove for another hook leaves the add flagged', () => {
+    const body = [
+      "        add_action('init', 'boot');",
+      "        remove_action('wp_head', 'boot');",
+    ];
+    expect(hits(inClass(body))).toEqual(['4:SV003']);
+  });
+
+  it.each([
+    ["add_filter('a', 'b');", "$this->remove_filter('a', 'b');"],
+    ["update_option('k', 1);", "$c::delete_option('k');"],
+    ["ini_set('precision', '4');", "$cfg->ini_restore('precision');"],
+    ["putenv('A=1');", "$env->putenv('A');"],
+  ])('%s is not restored by the method call %s', (write, restore) => {
+    const body = [
+      `    public function test_a() { ${write} }`,
+      '    protected function tearDown(): void {',
+      `        ${restore}`,
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual(['4:SV003']);
+  });
+
+  it('a commented-out remove_filter does not pair', () => {
+    const body = [
+      "        add_filter('the_title', 'x');",
+      "        // remove_filter('the_title', 'x');",
+    ];
+    expect(hits(inClass(body))).toEqual(['4:SV003']);
+  });
+
+  it('an add_filter inside tearDown is not its own restore', () => {
+    const body = [
+      '    protected function tearDown(): void {',
+      "        add_filter('a', 'b');",
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual(['5:SV003']);
+  });
+});
+
+describe('WP_UnitTestCase auto-restore (#1106 D9)', () => {
+  const wp = 'class Tests_Foo extends WP_UnitTestCase';
+
+  it('hooks and options are restored by the framework', () => {
+    const body = [
+      "        add_filter('the_title', 'x');",
+      "        update_option('blogname', 'x');",
+    ];
+    expect(hits(inClass(body, wp))).toEqual([]);
+  });
+
+  it('superglobals are NOT restored by the framework', () => {
+    expect(hits(inClass(["        $_GET['a'] = 1;"], wp))).toEqual(['4:SV003']);
+  });
+
+  it.each([
+    'class Tests_Foo extends \\WP_UnitTestCase',
+    'class Tests_Ajax extends WP_Ajax_UnitTestCase',
+    'class Tests_Base extends WP_UnitTestCase_Base',
+    'abstract class Tests_Base extends WP_UnitTestCase',
+  ])('%s counts as a WP base', (head) => {
+    expect(
+      hits(inClass(["        add_action('init', 'boot');"], head)),
+    ).toEqual([]);
+  });
+
+  it('a base named only in a comment does not count', () => {
+    const text = php(
+      '// class Old extends WP_UnitTestCase',
+      'class FooTest extends TestCase',
+      '{',
+      "    public function test_a() { add_filter('a', 'b'); }",
+      '}',
+    );
+    expect(hits(text)).toEqual(['5:SV003']);
+  });
+});
+
+// --- SV001 (D4) ------------------------------------------------------------
+
+describe('SV001 PHP declarations (#1106 D4)', () => {
+  it.each([
+    '$seen[] = 1;',
+    "$seen['k'] = 1;",
+    "$seen['a']['b'] = 1;",
+    "$seen .= 'x';",
+    '$seen += [1];',
+    '$seen ??= [];',
+    '$seen++;',
+    '++$seen;',
+    '$seen--;',
+    'array_push($seen, 1);',
+    'array_unshift($seen, 1);',
+    'array_splice($seen, 0, 1);',
+    'array_pop($seen);',
+    'array_shift($seen);',
+    "$seen->name = 'x';",
+  ])('a local static mutated by %s fires on its declaration', (stmt) => {
+    const body = [
+      '    public function test_a(): void',
+      '    {',
+      '        static $seen = [];',
+      `        ${stmt}`,
+      '    }',
+    ];
+    expect(hits(inClass(body))).toEqual(['6:SV001']);
+  });
+
+  it('a typed static property written through self:: fires', () => {
+    const body = [
+      '    protected static ?array $seen = null;',
+      '    public function test_a(): void { self::$seen[] = 1; }',
+    ];
+    expect(hits(inClass(body))).toEqual(['4:SV001']);
+  });
+
+  it('a read-only or plainly reassigned static is silent', () => {
+    const body = [
+      '    private static $fixture = null;',
+      '    public static function setUpBeforeClass(): void { self::$fixture = 1; }',
+      '    public static function tearDownAfterClass(): void { self::$fixture = null; }',
+      '    public function test_a(): void { $this->assertSame(1, self::$fixture); }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a static method is not a static variable', () => {
+    const body = [
+      '    public static function build(): array { return []; }',
+      '    public function test_a(): void { $build[] = 1; }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('a global accumulator appended to fires on the global line', () => {
+    const text = php(
+      'function test_it() {',
+      '    global $log;',
+      "    $log[] = 'x';",
+      '}',
+    );
+    expect(hits(text, 'test-log.php')).toEqual(['3:SV001']);
+  });
+
+  it('global $wpdb used for a query is silent', () => {
+    const text = php(
+      'function test_it() {',
+      '    global $wpdb;',
+      "    $wpdb->query('SELECT 1');",
+      '}',
+    );
+    expect(hits(text, 'test-db.php')).toEqual([]);
+  });
+
+  it('a global line naming several mutated vars fires once', () => {
+    const text = php(
+      'function test_it() {',
+      '    global $wp_query, $post;',
+      "    $post->post_title = 'x';",
+      '    $wp_query->is_404 = true;',
+      '}',
+    );
+    expect(hits(text, 'test-query.php')).toEqual(['3:SV001']);
+  });
+
+  // Fix round: a class static PROPERTY is only reachable as Name::$x; a bare
+  // $x in a method is a different, local variable.
+  it.each(['self', 'static', 'FooTest'])(
+    'a static property written through %s:: fires',
+    (scope) => {
+      const body = [
+        '    private static $items = [];',
+        `    public function test_a(): void { ${scope}::$items[] = 1; }`,
+      ];
+      expect(hits(inClass(body))).toEqual(['4:SV001']);
+    },
+  );
+
+  it('a static property is not indicted by a same-named local', () => {
+    const body = [
+      '    private static $items = [];',
+      '    public function test_a(): void { $items[] = 1; }',
+      '    public function test_b(): void { array_push($items, 2); }',
+    ];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  // A column-0 array is only the same variable at file scope, or inside a
+  // function that imports it with `global` (file-wide approximation).
+  it.each([
+    ['$registry = [];', "$registry['a'] = 1;"],
+    ['$registry = array();', 'array_push($registry, 1);'],
+  ])('a column-0 %s mutated at column 0 fires', (decl, mutate) => {
+    const text = php(decl, mutate);
+    expect(hits(text, 'test-registry.php')).toEqual(['2:SV001']);
+  });
+
+  it.each([
+    ['$registry = [];', "    $registry['a'] = 1;"],
+    ['$registry = array();', '    array_push($registry, 1);'],
+  ])('a column-0 %s mutated only in a function is silent', (decl, mutate) => {
+    const text = php(decl, 'function test_it() {', mutate, '}');
+    expect(hits(text, 'test-registry.php')).toEqual([]);
+  });
+
+  it('a column-0 array mutated through a global import fires', () => {
+    const text = php(
+      '$registry = [];',
+      'function test_it() {',
+      '    global $registry;',
+      "    $registry['a'] = 1;",
+      '}',
+    );
+    expect(hits(text, 'test-registry.php')).toEqual(['2:SV001', '4:SV001']);
+  });
+
+  it('a column-0 array that is only read is silent', () => {
+    const text = php(
+      "$map = ['a' => 1];",
+      'function test_it() {',
+      "    return $map['a'] === 1;",
+      '}',
+    );
+    expect(hits(text, 'test-map.php')).toEqual([]);
+  });
+
+  it('$x is not indicted by writes to $xy', () => {
+    const text = php(
+      '$x = [];',
+      'function test_it() {',
+      "    $xy['a'] = 1;",
+      '    ++$xy;',
+      '    array_push($xy, 1);',
+      '}',
+    );
+    expect(hits(text, 'test-x.php')).toEqual([]);
+  });
+
+  it('an indented array is local, not module scope', () => {
+    const text = php(
+      'function test_it() {',
+      '    $local = [];',
+      "    $local['a'] = 1;",
+      '}',
+    );
+    expect(hits(text, 'test-local.php')).toEqual([]);
+  });
+
+  it('a mutation only in a comment or a string does not indict', () => {
+    const text = php('$x = [];', "// $x['a'] = 1;", '$s = "$x[] = 1";');
+    expect(hits(text, 'test-x.php')).toEqual([]);
+  });
+
+  it('a superglobal at column 0 is SV003 only, never SV001', () => {
+    const text = php('$_GET = [];', "$_GET['a'] = 1;", "$GLOBALS['x'] = 1;");
+    expect(hits(text, 'test-g.php')).toEqual(['2:SV003', '3:SV003', '4:SV003']);
+  });
+});
+
+// --- SV004 (D10) -----------------------------------------------------------
+
+describe('SV004 PHP ordinal test names (#1106 D10)', () => {
+  it.each(['testFirst', 'testLast', 'testFinal', 'test_first', 'test_1_boots'])(
+    'function %s fires',
+    (name) => {
+      const body = [`    public function ${name}(): void {}`];
+      expect(hits(inClass(body))).toEqual(['4:SV004']);
+    },
+  );
+
+  it.each([
+    'testFirstMatchWins',
+    'test_firstname',
+    'testLastModifiedHeader',
+    'test_10ms',
+  ])('function %s is silent', (name) => {
+    const body = [`    public function ${name}(): void {}`];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  it('an ordinal name inside a string is data', () => {
+    const body = ["    private $n = 'function testFirst()';"];
+    expect(hits(inClass(body))).toEqual([]);
+  });
+
+  // Review fix: the PHP spellings are gated to .php, so Python and JS SV004
+  // behave exactly as they did before #1106.
+  it.each([
+    ['def testFirst(self):', 'test_a.py'],
+    ['def testlast(self):', 'test_a.py'],
+    ['function testFirst() {}', 'a.test.js'],
+    ['function test_1_x() {}', 'a.test.js'],
+  ])('%s in %s stays silent (PHP-only spelling)', (line, file) => {
+    expect(hits(line, file)).toEqual([]);
+  });
+
+  it('the pre-#1106 Python spellings still fire', () => {
+    expect(hits('def test_first():', 'test_a.py')).toEqual(['1:SV004']);
+    expect(hits('def test_1_boot():', 'test_a.py')).toEqual(['1:SV004']);
+  });
+});
+
+describe('--confirm declines PHP (#1106, out of scope)', () => {
+  it('detectFramework returns null for a PHP-only target', () => {
+    const options = { readdir: () => ['FooTest.php'], exists: () => false };
+    expect(detectFramework(['tests/FooTest.php'], options)).toBeNull();
+  });
+
+  // Review fix: a vitest/pytest marker in cwd must not route PHP to them.
+  it.each(['vitest.config.ts', 'pytest.ini'])(
+    'declines a PHP path even when %s exists',
+    (marker) => {
+      const options = {
+        readdir: () => ['FooTest.php'],
+        exists: (f: string) => f === marker,
+      };
+      expect(detectFramework(['tests/FooTest.php'], options)).toBeNull();
+      expect(detectFramework(['tests'], options)).toBeNull();
+    },
+  );
+
+  it('a directory with no tests still falls back to the config marker', () => {
+    const options = {
+      readdir: () => [] as string[],
+      exists: (f: string) => f === 'vitest.config.ts',
+    };
+    expect(detectFramework(['tests'], options)).toBe('vitest');
+  });
+});

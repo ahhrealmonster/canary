@@ -27,6 +27,8 @@
 // lines. Detection is language-agnostic like the rest of the scanner; a JS
 // generator `yield` could open a phantom region, but a same-family restore
 // idiom inside one is overwhelmingly teardown-intent anyway.
+// PHP (#1106): tearDown*/tear_down*/wpTearDown* bodies are regions too; see
+// rules.mjs for the unrestorable, pairAnywhere and wpAutoRestored families.
 //
 // Known non-suppressors, on purpose:
 // - vi.stubEnv/vi.unstubAllEnvs and monkeypatch only undo their OWN
@@ -37,7 +39,13 @@
 //   recognized; only idioms where the restore call is spelled out are. A
 //   missed restore is a false flag, the safe direction.
 
-import { SINGLETON_FAMILIES } from './rules.mjs';
+import {
+  SINGLETON_FAMILIES,
+  familiesFor,
+  PHP_TEARDOWN_FN,
+  COMMENT_LINE,
+  WP_TESTCASE_BASE,
+} from './rules.mjs';
 import {
   stringLiteralRanges,
   inStringLiteral,
@@ -73,7 +81,8 @@ function literalKey(expr) {
 }
 
 /** Key from an assign/delete match: dot-property group or bracket literal. */
-function keyOf(match) {
+function keyOf(match, family) {
+  if (family.keyOf) return family.keyOf(match); // putenv NAME= (#1106)
   // process.env has (dotKey, bracketExpr); the Python families have a single
   // bracket/arg group. A dot-property is always a literal key.
   if (match.length > 2) return match[1] ?? literalKey(match[2]);
@@ -84,15 +93,16 @@ function keyOf(match) {
  * Classify the singleton mutation on `line`, if any.
  * @param {string} line
  * @param {Array<[number, number]>} ranges string ranges for `line`
+ * @param {boolean} [isPhp] include the PHP families (#1106)
  * @returns {{family: string, key: string|null, rhs: string}|null}
  */
-export function classifyMutation(line, ranges) {
-  for (const family of SINGLETON_FAMILIES) {
+export function classifyMutation(line, ranges, isPhp = false) {
+  for (const family of familiesFor(isPhp)) {
     const match = execOutsideStrings(family.assign, line, ranges);
     if (!match) continue;
     return {
       family: family.id,
-      key: keyOf(match),
+      key: keyOf(match, family),
       rhs: line.slice(match.index + match[0].length),
     };
   }
@@ -144,37 +154,24 @@ const PY_FINALLY = /^(\s*)finally\s*:/;
 const indentOf = (line) => /^\s*/.exec(line)[0].length;
 const isBlank = (line) => line.trim() === '';
 
-/** JS: afterEach/afterAll call bodies, paren-balanced and string-aware. */
-function collectJsRegions(lines, rangesByLine, region) {
+/**
+ * Balanced bodies opened at `re`, string-aware: `finally { ... }` (#733) by
+ * default, afterEach/afterAll call parens, and PHP teardown methods (#1106).
+ * Counting starts at the token's last char, never the line start (`} finally
+ * {` opens with the TRY block's `}`), and runs on to the first opener, so an
+ * Allman brace on the next line works. Capped if unclosed.
+ */
+function collectJsFinallyRegions(
+  lines,
+  rangesByLine,
+  region,
+  re = JS_FINALLY,
+  [open, close] = '{}',
+) {
   lines.forEach((line, i) => {
-    const token = execOutsideStrings(JS_TEARDOWN_TOKEN, line, rangesByLine[i]);
+    const token = execOutsideStrings(re, line, rangesByLine[i]);
     if (!token) return;
     let depth = 0;
-    let col = token.index + token[0].length - 1; // the opening paren
-    for (let j = i; j < lines.length && j <= i + REGION_CAP_LINES; j += 1) {
-      region.add(j);
-      const text = lines[j];
-      const start = j === i ? col : 0;
-      for (let k = start; k < text.length; k += 1) {
-        if (inStringLiteral(rangesByLine[j], k)) continue;
-        if (text[k] === '(') depth += 1;
-        else if (text[k] === ')') {
-          depth -= 1;
-          if (depth === 0) return;
-        }
-      }
-    }
-  });
-}
-
-/** JS: `finally { ... }` bodies, brace-balanced and string-aware (#733). */
-function collectJsFinallyRegions(lines, rangesByLine, region) {
-  lines.forEach((line, i) => {
-    const token = execOutsideStrings(JS_FINALLY, line, rangesByLine[i]);
-    if (!token) return;
-    let depth = 0;
-    // Count from the finally's own `{`, never the line start -- the common
-    // spelling `} finally {` opens with the TRY block's closing brace.
     let col = token.index + token[0].length - 1;
     for (let j = i; j < lines.length && j <= i + REGION_CAP_LINES; j += 1) {
       region.add(j);
@@ -182,8 +179,8 @@ function collectJsFinallyRegions(lines, rangesByLine, region) {
       const start = j === i ? col : 0;
       for (let k = start; k < text.length; k += 1) {
         if (inStringLiteral(rangesByLine[j], k)) continue;
-        if (text[k] === '{') depth += 1;
-        else if (text[k] === '}') {
+        if (text[k] === open) depth += 1;
+        else if (text[k] === close) {
           depth -= 1;
           if (depth === 0) return;
         }
@@ -192,33 +189,30 @@ function collectJsFinallyRegions(lines, rangesByLine, region) {
   });
 }
 
+// Python regions are indentation-scoped, as [opener, strict]: a def/finally
+// body is indented DEEPER than its opener; post-yield code may share it.
+const PY_SCOPED = [
+  [PY_TEARDOWN_DEF, true],
+  [PY_YIELD, false],
+  [PY_FINALLY, true], // #733
+];
+
+/** Add the lines after `i` that stay inside an indentation scope. */
+function addIndentScope(lines, i, indent, strict, region) {
+  for (let j = i + 1; j < lines.length; j += 1) {
+    const depth = indentOf(lines[j]);
+    const inside = depth > indent || (!strict && depth === indent);
+    if (!isBlank(lines[j]) && !inside) return;
+    region.add(j);
+  }
+}
+
 /** Python: teardown def bodies, post-yield code, addCleanup lines. */
 function collectPyRegions(lines, rangesByLine, region) {
   lines.forEach((line, i) => {
-    const def = PY_TEARDOWN_DEF.exec(line);
-    if (def) {
-      const indent = def[1].length;
-      for (let j = i + 1; j < lines.length; j += 1) {
-        if (!isBlank(lines[j]) && indentOf(lines[j]) <= indent) break;
-        region.add(j);
-      }
-    }
-    const yielded = PY_YIELD.exec(line);
-    if (yielded) {
-      const indent = yielded[1].length;
-      for (let j = i + 1; j < lines.length; j += 1) {
-        if (!isBlank(lines[j]) && indentOf(lines[j]) < indent) break;
-        region.add(j);
-      }
-    }
-    // `finally:` is indentation-scoped, like the def and yield regions (#733).
-    const fin = PY_FINALLY.exec(line);
-    if (fin) {
-      const indent = fin[1].length;
-      for (let j = i + 1; j < lines.length; j += 1) {
-        if (!isBlank(lines[j]) && indentOf(lines[j]) <= indent) break;
-        region.add(j);
-      }
+    for (const [opener, strict] of PY_SCOPED) {
+      const m = opener.exec(line);
+      if (m) addIndentScope(lines, i, m[1].length, strict, region);
     }
     if (execOutsideStrings(/\baddCleanup\b/, line, rangesByLine[i])) {
       region.add(i);
@@ -227,17 +221,56 @@ function collectPyRegions(lines, rangesByLine, region) {
 }
 
 /**
+ * Record restores (#493): a family's idioms inside a teardown region, plus
+ * (#1106) a pairAnywhere family's deletes on any code line of the file.
+ */
+function recordRestores(lines, rangesByLine, region, isPhp, record) {
+  const families = familiesFor(isPhp);
+  lines.forEach((line, i) => {
+    const inRegion = region.has(i);
+    const code = !COMMENT_LINE.test(line);
+    for (const family of families) {
+      const paired = family.pairAnywhere; // add_filter never restores itself
+      const patterns = [
+        ...(inRegion && !paired ? [family.assign, ...family.restoreAll] : []),
+        ...(inRegion || (code && paired) ? family.deletes : []),
+      ];
+      for (const pattern of patterns) {
+        for (const m of execAllOutsideStrings(pattern, line, rangesByLine[i])) {
+          record(family.id, keyOf(m, family)); // restoreAll: no group -> null
+        }
+      }
+    }
+  });
+}
+
+/** A family-level verdict that overrides key evidence, else null (#1106). */
+function familyVerdict(familyId, wpAuto) {
+  const family = SINGLETON_FAMILIES.find((f) => f.id === familyId);
+  if (family?.unrestorable) return false;
+  if (wpAuto && family?.wpAutoRestored) return true;
+  return null;
+}
+
+/**
  * Analyze which globals the file restores in teardown.
  * @param {string} text file contents
+ * @param {boolean} [isPhp] enable the PHP families and regions (#1106)
  * @returns {{restores: (family: string, key: string|null) => boolean}}
  */
-export function analyzeRestoration(text) {
+export function analyzeRestoration(text, isPhp = false) {
   const lines = splitLines(text);
   const rangesByLine = lines.map((l) => stringLiteralRanges(l));
   const region = new Set();
-  collectJsRegions(lines, rangesByLine, region);
-  collectJsFinallyRegions(lines, rangesByLine, region);
-  collectPyRegions(lines, rangesByLine, region);
+  const collect = (token, pair) =>
+    collectJsFinallyRegions(lines, rangesByLine, region, token, pair);
+  collect();
+  // A PHP `yield` is a data provider, not fixture teardown: no Python regions.
+  if (isPhp) collect(PHP_TEARDOWN_FN);
+  else {
+    collect(JS_TEARDOWN_TOKEN, '()');
+    collectPyRegions(lines, rangesByLine, region);
+  }
 
   const restoresAll = new Set();
   const restoredKeys = new Map(); // family id -> Set<key>
@@ -250,23 +283,14 @@ export function analyzeRestoration(text) {
     restoredKeys.get(familyId).add(key);
   };
 
-  for (const i of region) {
-    const line = lines[i];
-    const ranges = rangesByLine[i];
-    for (const family of SINGLETON_FAMILIES) {
-      for (const pattern of [family.assign, ...family.deletes]) {
-        for (const match of execAllOutsideStrings(pattern, line, ranges)) {
-          record(family.id, keyOf(match));
-        }
-      }
-      for (const pattern of family.restoreAll) {
-        if (execOutsideStrings(pattern, line, ranges)) record(family.id, null);
-      }
-    }
-  }
+  recordRestores(lines, rangesByLine, region, isPhp, record);
+  // D9: a WP_UnitTestCase base restores hooks and rolls back the DB.
+  const wpAuto = isPhp && lines.some((l) => WP_TESTCASE_BASE.test(l));
 
   return {
     restores(familyId, key) {
+      const verdict = familyVerdict(familyId, wpAuto);
+      if (verdict !== null) return verdict;
       if (restoresAll.has(familyId)) return true;
       return key != null && (restoredKeys.get(familyId)?.has(key) ?? false);
     },
